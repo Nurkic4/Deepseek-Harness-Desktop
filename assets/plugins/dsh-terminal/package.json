@@ -1,0 +1,20 @@
+{
+  "name": "@deepseek-ai/dsh-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Desktop 配套多终端：支持独立标签、Git Bash 与 PowerShell 7、ConPTY 交互及 xterm.js 完整终端渲染",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./client": { "default": "./lib/client.js" },
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "client": {
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"],
+      "platform": "web"
+    }
+  }
+}

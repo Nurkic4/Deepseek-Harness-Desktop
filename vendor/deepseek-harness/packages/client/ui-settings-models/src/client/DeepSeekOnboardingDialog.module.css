@@ -1,0 +1,25 @@
+.description {
+  margin: 0;
+  font-size: 14px;
+  line-height: 24px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.selectionLabel { margin: 20px 0 10px; font-size: 13px; font-weight: 500; color: var(--dsw-alias-label-primary); }
+.providerList { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.providerButton { display: flex; min-height: 58px; padding: 10px 12px; flex-direction: column; align-items: flex-start; cursor: pointer; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; }
+.providerButton:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.providerButtonSelected { border-color: var(--dsw-alias-brand-primary); box-shadow: inset 0 0 0 1px var(--dsw-alias-brand-primary); }
+.providerName { font-size: 14px; font-weight: 500; line-height: 20px; }
+.providerKind { color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 16px; }
+
+.editor {
+  margin-top: 24px;
+}
+
+@media (max-width: 560px) {
+  .providerList { grid-template-columns: 1fr; }
+  .editor {
+    margin-top: 20px;
+  }
+}

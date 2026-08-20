@@ -1,0 +1,68 @@
+/* Assistant flow body: full-width narration (figma 16/28), block gap 16.
+   IconActions sit below the body with an explicit 16px top margin (figma
+   43:32997) — separate from the body's internal gap so the footer spacing
+   stays fixed when the body is a single block. */
+
+.root {
+  display: flex;
+  flex-direction: column;
+  /* Keep long replies readable without forcing the conversation column to
+     become a wide text wall. The parent still controls the outer width. */
+  max-inline-size: 78ch;
+  font-size: 16px;
+  line-height: 28px;
+  color: var(--dsw-alias-label-primary);
+  text-wrap: pretty;
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-inline-size: 0;
+}
+
+/* MarkdownText owns the semantic elements; this scoped rule gives prose a
+   stable reading rhythm while leaving code blocks and tool cards untouched. */
+.body :where(p, ul, ol, blockquote) {
+  margin-block: 0;
+}
+
+.body :where(a) {
+  color: var(--dsw-alias-interactive-primary);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.body :where(pre, code) {
+  font-variant-ligatures: none;
+}
+
+.body :where(::selection) {
+  background: color-mix(in srgb, var(--dsw-alias-interactive-primary) 28%, transparent);
+}
+
+/* Interrupted-turn terminal marker: quiet inline tag, no animation. */
+.stopped {
+  align-self: flex-start;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 18px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root[data-streaming='true'] * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+/* Finalized footer offset (figma 43:32997); chrome lives in MessageIconActions. */
+.actions {
+  margin-top: 16px;
+  /* Optical align with 28px icon hit targets that pad 6px past the glyph. */
+  margin-left: -6px;
+}

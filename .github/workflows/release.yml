@@ -1,0 +1,63 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch: # 手动触发，产出安装包 artifacts
+  push:
+    tags: ['v*'] # 打 tag 时构建并发布 GitHub Release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # deepseek-harness 的构建依赖 node:sqlite（Node >= 22.5）
+          node-version: 22
+          cache: npm
+
+      - name: Install app dependencies
+        run: npm ci
+
+      # .npmrc 设置了 electron_skip_binary_download，CI 需显式拉取 Electron 二进制
+      - name: Download Electron binary
+        run: node node_modules/electron/install.js
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Prepare vendored harness (clone + pnpm install + build)
+        run: node scripts/setup-harness.js
+
+      - name: Build NSIS setup installer
+        run: npm run dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeek-Harness-windows-x64
+          path: |
+            dist/Deepseek-Harness-Desktop-Setup-*.exe
+            dist/Deepseek-Harness-Desktop-Setup-*.exe.blockmap
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/Deepseek-Harness-Desktop-Setup-*.exe \
+            dist/Deepseek-Harness-Desktop-Setup-*.exe.blockmap \
+            --title "Deepseek-Harness-Desktop $GITHUB_REF_NAME" \
+            --generate-notes \
+            --latest

@@ -1,0 +1,24 @@
+{
+  "name": "@deepseek-ai/dsh-browser",
+  "version": "0.1.2",
+  "private": true,
+  "description": "DSH Desktop embedded browser with shared human and agent control",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./client": { "default": "./lib/client.js" },
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "client": {
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*",
+    "react": "^18.2.0"
+  }
+}

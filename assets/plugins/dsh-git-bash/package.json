@@ -1,0 +1,16 @@
+{
+  "name": "@deepseek-ai/dsh-git-bash",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Desktop Git Bash tool for reliable POSIX-style commands on Windows",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  }
+}

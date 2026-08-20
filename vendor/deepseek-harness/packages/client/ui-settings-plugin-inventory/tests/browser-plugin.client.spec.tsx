@@ -1,0 +1,177 @@
+// @vitest-environment jsdom
+import { Context, Service } from '@deepseek-ai/cordis'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup } from '@testing-library/react'
+import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
+import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
+import { resolveSlotLabel } from '@deepseek-ai/dsh-client-ui-slots'
+import { usePinnedBrowserLanguages } from '@deepseek-ai/dsh-client-test-runtime'
+import { apply, inject, NS } from '../src/client/index.ts'
+import { MarketplaceSettingsTab } from '../src/client/MarketplaceSettingsTab.tsx'
+import { PluginInventorySettingsTab } from '../src/client/PluginInventorySettingsTab.tsx'
+import type { PluginInventorySettingsTabInjected } from '../src/client/PluginInventorySettingsTab.tsx'
+
+usePinnedBrowserLanguages('zh-CN')
+afterEach(cleanup)
+
+const EMPTY = { entries: [], skills: [] }
+type ListResult =
+  | { readonly ok: true; readonly value: typeof EMPTY }
+  | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }
+
+async function bench() {
+  const ctx = new Context()
+  await ctx.plugin(SlotRegistry).await()
+  const locale = new LocaleRuntime(ctx)
+  ctx.provide('locale', locale)
+  class RemoteService extends Service {
+    constructor(serviceCtx: Context) {
+      super(serviceCtx, 'remote')
+    }
+  }
+  new RemoteService(ctx)
+  const list = vi.fn<() => Promise<ListResult>>()
+    .mockResolvedValue({ ok: true, value: EMPTY })
+  const setEntryEnabled = vi.fn(async () => ({ ok: true, value: undefined }))
+  const setSkillEnabled = vi.fn(async () => ({ ok: true, value: undefined }))
+  ctx.provide('remote.pluginInventory', { list, setEntryEnabled, setSkillEnabled })
+  ctx.provide('connection', {
+    api: { skills: { list: vi.fn() } },
+  })
+  ctx.provide('sessions', {
+    list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} },
+  })
+  return { ctx, slots: ctx.get('slots') as SlotRegistry, locale, list, setEntryEnabled, setSkillEnabled }
+}
+
+function declare(slots: SlotRegistry): () => void {
+  return slots.register({
+    name: 'root',
+    children: { 'settings.plugins.tab': { kind: 'list', scope: 'root' } },
+  } as never, () => null)
+}
+
+describe('ui-settings-plugin-inventory browser plugin', () => {
+  it('declares only the services used by the Settings Remote contribution', () => {
+    expect(inject).toEqual(['slots', 'locale', 'remote', 'remote.pluginInventory', 'connection', 'sessions'])
+  })
+
+  it('registers a localized tab without reading the Remote eagerly', async () => {
+    const b = await bench()
+    declare(b.slots)
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+
+    const entry = b.slots.entries('settings.plugins.tab')[0]!
+    expect(entry.component).toBe(PluginInventorySettingsTab)
+    expect(entry.options).toMatchObject({ id: 'all', order: 10 })
+    expect(entry.locale).toBe(NS)
+    expect(resolveSlotLabel(entry.options.label)).toBe('插件列表')
+    expect(b.list).not.toHaveBeenCalled()
+
+    const injected = (entry.inject as unknown as () => PluginInventorySettingsTabInjected)()
+    await expect(injected.list()).resolves.toEqual(EMPTY)
+    await expect(injected.setEntryEnabled('entry' as never, false)).resolves.toBeUndefined()
+    await expect(injected.setSkillEnabled('skill', false)).resolves.toBeUndefined()
+    expect(b.setEntryEnabled).toHaveBeenCalledWith('entry', false)
+    expect(b.setSkillEnabled).toHaveBeenCalledWith('skill', false)
+    expect(b.list).toHaveBeenCalledOnce()
+    b.list.mockResolvedValueOnce({ ok: false, error: { code: 'REMOTE_ERROR', message: 'unavailable' } })
+    await expect(injected.list()).rejects.toThrow('pluginInventory.list failed: REMOTE_ERROR: unavailable')
+    await b.ctx.fiber.dispose()
+  })
+
+  it('follows locale and recovers across late declaration and declarer reload', async () => {
+    const b = await bench()
+    const fiber = b.ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    expect(b.slots.entries('settings.plugins.tab')).toHaveLength(0)
+
+    const stop = declare(b.slots)
+    await vi.waitFor(() => { expect(b.slots.entries('settings.plugins.tab')).toHaveLength(1) })
+    b.locale.setLocale('en')
+    expect(resolveSlotLabel(b.slots.entries('settings.plugins.tab')[0]!.options.label)).toBe('Plugin list')
+
+    stop()
+    expect(b.slots.entries('settings.plugins.tab')).toHaveLength(0)
+    declare(b.slots)
+    await vi.waitFor(() => {
+      expect(b.slots.entries('settings.plugins.tab')[0]?.component).toBe(PluginInventorySettingsTab)
+    })
+
+    await fiber.dispose()
+    expect(b.slots.entries('settings.plugins.tab')).toHaveLength(0)
+    expect(() => b.locale.register(NS, 'zh', {})).not.toThrow()
+    await b.ctx.fiber.dispose()
+  })
+
+  it('registers the marketplace tab only when the desktop shell can install', async () => {
+    const b = await bench()
+    declare(b.slots)
+    const shell = {
+      listMarketplace: vi.fn(async () => ({ items: [] })),
+      listInstalledPlugins: vi.fn(async () => ({ plugins: [] })),
+      installPlugin: vi.fn(async (_spec: string) => ({ ok: true })),
+      uninstallPlugin: vi.fn(async (_name: string) => ({ ok: true })),
+    }
+    ;(window as Window & { shell?: unknown }).shell = shell
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    const tabs = b.slots.entries('settings.plugins.tab')
+    expect(tabs.map(entry => entry.options.id)).toEqual(['marketplace', 'all'])
+    expect(tabs.find(entry => entry.options.id === 'marketplace')?.options.order).toBe(5)
+    const market = tabs.find(entry => entry.options.id === 'marketplace')!
+    expect(market.component).toBe(MarketplaceSettingsTab)
+    expect(resolveSlotLabel(market.options.label)).toBe('插件市场')
+    const injected = (market.inject as () => {
+      listMarketplace: typeof shell.listMarketplace
+      listInstalled: typeof shell.listInstalledPlugins
+      installPlugin: typeof shell.installPlugin
+      uninstallPlugin: typeof shell.uninstallPlugin
+      openExternal: (url: string) => Promise<boolean>
+      saveGithubToken: (token: string) => Promise<void>
+      hasGithubToken: () => Promise<boolean>
+      onProgress: (handler: (payload: { line?: string }) => void) => () => void
+    })()
+    await expect(injected.listMarketplace()).resolves.toEqual({ items: [] })
+    await expect(injected.listInstalled()).resolves.toEqual({ plugins: [] })
+    await expect(injected.installPlugin('github:a/b')).resolves.toEqual({ ok: true })
+    await expect(injected.uninstallPlugin('pkg')).resolves.toEqual({ ok: true })
+    await expect(injected.openExternal('https://example.com')).resolves.toBe(false)
+    await injected.saveGithubToken('tok')
+    await expect(injected.hasGithubToken()).resolves.toBe(false)
+    expect(injected.onProgress(() => {})).toEqual(expect.any(Function))
+    delete (window as Window & { shell?: unknown }).shell
+    await b.ctx.fiber.dispose()
+  })
+
+  it('forwards optional desktop shell methods when they exist', async () => {
+    const b = await bench()
+    declare(b.slots)
+    const off = vi.fn()
+    const shell = {
+      listMarketplace: vi.fn(async () => ({ items: [] })),
+      listInstalledPlugins: vi.fn(async () => ({ plugins: [] })),
+      installPlugin: vi.fn(async (_spec: string) => ({ ok: true })),
+      uninstallPlugin: vi.fn(async (_name: string) => ({ ok: true })),
+      openExternal: vi.fn(async () => true),
+      saveConfig: vi.fn(async () => ({ hasGithubToken: true })),
+      getConfig: vi.fn(async () => ({ hasGithubToken: true })),
+      onPluginProgress: vi.fn(() => off),
+    }
+    ;(window as Window & { shell?: unknown }).shell = shell
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    const market = b.slots.entries('settings.plugins.tab').find(entry => entry.options.id === 'marketplace')!
+    const injected = (market.inject as () => {
+      openExternal: (url: string) => Promise<boolean>
+      saveGithubToken: (token: string) => Promise<void>
+      hasGithubToken: () => Promise<boolean>
+      onProgress: (handler: (payload: { line?: string }) => void) => () => void
+    })()
+    await expect(injected.openExternal('https://example.com')).resolves.toBe(true)
+    await injected.saveGithubToken('tok')
+    expect(shell.saveConfig).toHaveBeenCalledWith({ githubToken: 'tok' })
+    await expect(injected.hasGithubToken()).resolves.toBe(true)
+    expect(injected.onProgress(() => {})).toBe(off)
+    delete (window as Window & { shell?: unknown }).shell
+    await b.ctx.fiber.dispose()
+  })
+})

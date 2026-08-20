@@ -1,0 +1,646 @@
+/**
+ * Browser theme registry over the `--dsw-*` token stylesheets. The service
+ * owns the live color-scheme preference (`light`/`dark`/`system`), the
+ * light/dark theme-family halves, and derived alias tokens; it resolves
+ * `system` through `prefers-color-scheme` and publishes immutable snapshots.
+ * It never touches the DOM — ui-layout's presenter consumes the resolved
+ * snapshot. Durable fields live in the Host `ui-theme` settings section.
+ */
+import type { Context } from '@deepseek-ai/cordis'
+import type { BoundActions } from '@deepseek-ai/dsh-client-ui-slots'
+import type { ClientContext, SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type { AppearanceSectionInjected } from './AppearanceSection.tsx'
+import { AppearanceSection } from './AppearanceSection.tsx'
+import { applyAppearanceDocumentExtras } from '../appearance-apply.ts'
+import { createAppearanceRowStore } from './settings-store.ts'
+import { en, zh, type ThemeKey } from './locales.ts'
+import { deriveThemeTokens } from '../derive.ts'
+import {
+  DEFAULT_FAMILY_ID, type ThemeFamily, type ThemeTokens as FamilyTokens,
+} from '../theme-family.ts'
+import { listThemeFamilies, resolveThemeFamily } from '../builtin-families.ts'
+import { clampWallpaperEffect, isWallpaperDataUrl, mixWallpaperSurfaces } from '../wallpaper.ts'
+import {
+  DEFAULT_PREFERENCE, DEFAULT_THEME_SETTINGS, isThemePreference,
+  THEME_CUSTOM_THEMES_FIELD, THEME_DARK_FAMILY_FIELD, THEME_GLASS_OPACITY_FIELD,
+  THEME_LIGHT_FAMILY_FIELD, THEME_PREFERENCE_FIELD, THEME_SETTINGS_NAMESPACE,
+  THEME_WALLPAPER_BLUR_FIELD, THEME_WALLPAPER_IMAGE_FIELD, THEME_WALLPAPER_PIXELATE_FIELD,
+  resolveThemeSettings,
+  type ThemePreference, type ThemeSettings,
+} from '../theme-settings.ts'
+
+export type { AppearanceSectionComponentProps, AppearanceSectionInjected } from './AppearanceSection.tsx'
+export type { AppearanceRowState } from './settings-store.ts'
+export type { ThemeKey } from './locales.ts'
+export type { ThemePreference, ThemeSettings } from '../theme-settings.ts'
+export type { ThemeFamily, ThemeSeeds, ThemeTokens as FamilyThemeTokens } from '../theme-family.ts'
+
+/** Namespace owning this feature's settings copy. */
+export const SETTINGS_NS = 'settings.theme'
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface LocaleNamespaceMap {
+    /** The Appearance settings page copy. */
+    'settings.theme': ThemeKey
+  }
+}
+
+/** Theme token dictionary: --dsw-alias-* overrides keyed by variable name. */
+export type ThemeTokens = FamilyTokens
+
+/**
+ * One override-layer token value: both palette modes are mandatory (repeat
+ * the same value when the token is scheme-invariant) so an override never
+ * goes illegible when the user switches to the other scheme.
+ */
+export interface ThemeTokenModes {
+  /** Value applied while the light base palette is active. */
+  light: string
+  /** Value applied while the dark base palette is active. */
+  dark: string
+}
+
+/** Override-layer dictionary: token names to per-mode value pairs. */
+export type ThemeTokenOverrides = Record<string, ThemeTokenModes>
+
+/** One selectable theme: id, dark/light semantics, and alias-token overrides. */
+export interface ThemeDefinition {
+  /** Theme id (the setTheme argument for concrete themes). */
+  id: string
+  /**
+   * Which base palette this theme builds on. The presenter switches
+   * `body[data-ds-dark-theme]` from this field — never from the id.
+   */
+  colorScheme: 'light' | 'dark'
+  /** Alias-layer overrides applied as inline CSS variables over the base palette. */
+  tokens: ThemeTokens
+}
+
+/** Immutable theme state published on every change. */
+export interface ThemeSnapshot {
+  /** The persisted color-scheme preference (may be `system`). */
+  preference: ThemePreference
+  /**
+   * The resolved active theme (`system` resolved via prefers-color-scheme)
+   * with family tokens and override layers folded in.
+   */
+  active: ThemeDefinition
+  /** Registered extension themes in registration order (includes light/dark). */
+  themes: readonly ThemeDefinition[]
+  /** Builtin plus custom families in library order. */
+  families: readonly ThemeFamily[]
+  /** Family painting the light half. */
+  activeLightThemeId: string
+  /** Family painting the dark half. */
+  activeDarkThemeId: string
+  /** User-created families. */
+  customThemes: readonly ThemeFamily[]
+  /** Overlay solidity percent. */
+  glassOpacity: number
+  /** Wallpaper data URL; empty means no wallpaper. */
+  wallpaperImage: string
+  /** Frosted-glass blur on the wallpaper, 0–100. */
+  wallpaperBlur: number
+  /** Pixelation on the wallpaper, 0–100. */
+  wallpaperPixelate: number
+  /** Interface font preference. */
+  fontFamilySans: string
+  /** Monospace font preference. */
+  fontFamilyCode: string
+  /** Root font size in px. */
+  fontSizeInterface: number
+  /** Code font size in px. */
+  fontSizeCode: number
+  /** Composer font preference. */
+  fontFamilyComposer: string
+  /** Terminal font preference. */
+  fontFamilyTerminal: string
+  /** Monotonic change counter (registry or active changes). */
+  revision: number
+}
+
+/** One theme token exposed to pre-definition Cordis inspection. */
+export interface ThemeTokenInspection {
+  /** Token name accepted by {@link ThemeService.overrideTokens}. */
+  name: string
+  /** Intended visual role. */
+  description: string
+  /** CSS value category. */
+  valueType: string
+  /** Whether override layers must supply both palette modes. */
+  requiresLightAndDark: boolean
+  /** CSS custom property consumed by UI styles. */
+  cssVariable?: string
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    theme: ThemeRuntime
+  }
+  interface Events {
+    /**
+     * Theme state changed (preference switched, registry updated, or the OS
+     * color scheme changed while the preference is `system`).
+     * @param snapshot - Current immutable theme snapshot.
+     * @mode emit
+     */
+    'theme/change'(snapshot: ThemeSnapshot): void
+  }
+}
+
+const BUILTIN_THEMES: readonly ThemeDefinition[] = Object.freeze([
+  Object.freeze({ id: 'light', colorScheme: 'light' as const, tokens: Object.freeze({}) }),
+  Object.freeze({ id: 'dark', colorScheme: 'dark' as const, tokens: Object.freeze({}) }),
+])
+
+const BUILTIN_INSPECT_TOKENS: readonly ThemeTokenInspection[] = Object.freeze([
+  { name: '--dsw-alias-bg-base', description: 'Application base background.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-bg-base' },
+  { name: '--dsw-alias-bg-layer-1', description: 'Primary raised surface background.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-bg-layer-1' },
+  { name: '--dsw-alias-bg-layer-2', description: 'Secondary nested surface background.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-bg-layer-2' },
+  { name: '--dsw-alias-bg-overlay', description: 'Overlay and popover background.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-bg-overlay' },
+  { name: '--dsw-alias-border-l1', description: 'Primary subtle border.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-border-l1' },
+  { name: '--dsw-alias-border-l2', description: 'Secondary stronger border.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-border-l2' },
+  { name: '--dsw-alias-brand-primary', description: 'Primary brand accent.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-brand-primary' },
+  { name: '--dsw-alias-label-primary', description: 'Primary text color.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-label-primary' },
+  { name: '--dsw-alias-label-secondary', description: 'Secondary text color.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-label-secondary' },
+  { name: '--dsw-alias-state-error-primary', description: 'Primary error state color.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-state-error-primary' },
+  { name: '--dsw-alias-state-success-primary', description: 'Primary success state color.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-state-success-primary' },
+  { name: '--dsw-alias-state-warn-primary', description: 'Primary warning state color.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-alias-state-warn-primary' },
+  { name: '--dsw-specific-sidebar-fill', description: 'Sidebar column and title-row background.', valueType: 'CSS color', requiresLightAndDark: true, cssVariable: '--dsw-specific-sidebar-fill' },
+  { name: '--dsw-alias-glass-opacity', description: 'Overlay and composer solidity percent.', valueType: 'CSS percentage', requiresLightAndDark: true, cssVariable: '--dsw-alias-glass-opacity' },
+])
+
+/**
+ * Theme registry and preference owner. `light`/`dark` are built in (the base
+ * stylesheets carry both palettes); product families derive alias-layer
+ * overrides. Reads go through {@link getTheme}; color-scheme writes through
+ * {@link setTheme}; half writes through {@link setThemeHalf}; continuous sync
+ * only through the `theme/change` event.
+ */
+export class ThemeRuntime {
+  private readonly ctx: Context
+  private readonly host: SettingsScope<ThemeSettings>
+  private themes: ThemeDefinition[] = [...BUILTIN_THEMES]
+  private settings: ThemeSettings = { ...DEFAULT_THEME_SETTINGS, customThemes: [] }
+  private preference: ThemePreference
+  private revision = 0
+  private snapshot: ThemeSnapshot
+  private readonly media: MediaQueryList | undefined
+  private readonly overrides = new Map<string, { seq: number; tokens: ThemeTokenOverrides }>()
+  private overrideSeq = 0
+  private readonly pendingWrites = new Map<string, unknown>()
+  private writeTimer: ReturnType<typeof setTimeout> | undefined
+  private inFlightWrites = 0
+  private previewedFamily: ThemeFamily | null = null
+
+  /**
+   * @param ctx - owning context (change events are emitted on it; the
+   * media-query and scope listeners are released through ctx.effect on dispose).
+   * @param host - durable preference scope owned by the same plugin.
+   */
+  constructor(ctx: Context, host: SettingsScope<ThemeSettings>) {
+    this.ctx = ctx
+    this.host = host
+    this.preference = DEFAULT_PREFERENCE
+    this.media = typeof matchMedia === 'undefined' ? undefined : matchMedia('(prefers-color-scheme: dark)')
+    this.snapshot = this.buildSnapshot()
+    if (this.media !== undefined) {
+      const media = this.media
+      const onChange = (): void => {
+        if (this.preference !== 'system') return
+        this.publish()
+      }
+      ctx.effect(() => {
+        media.addEventListener('change', onChange)
+        return () => { media.removeEventListener('change', onChange) }
+      }, 'ui-theme: prefers-color-scheme listener')
+    }
+    ctx.effect(() => host.subscribe(() => { this.adopt() }), 'ui-theme: settings scope adoption')
+    ctx.effect(() => () => { this.flushWrites() }, 'ui-theme: flush pending settings writes')
+    this.adopt()
+  }
+
+  /**
+   * Queue one durable field write. Continuous controls (sliders, font inputs)
+   * fire on every input tick; the local snapshot publishes immediately while
+   * the Host write is debounced so a drag does not flood the settings RPC.
+   */
+  private queueWrite(field: string, value: unknown): void {
+    this.pendingWrites.set(field, value)
+    if (this.writeTimer !== undefined) clearTimeout(this.writeTimer)
+    this.writeTimer = setTimeout(() => { this.flushWrites() }, 300)
+  }
+
+  /** Send every pending field to the Host scope, preserving queue order. */
+  private flushWrites(): void {
+    if (this.writeTimer !== undefined) {
+      clearTimeout(this.writeTimer)
+      this.writeTimer = undefined
+    }
+    if (this.pendingWrites.size === 0) return
+    const writes = [...this.pendingWrites]
+    this.pendingWrites.clear()
+    for (const [field, value] of writes) {
+      this.inFlightWrites += 1
+      this.host.set(field, value)
+        .catch(() => { /* scope.set already reloads Host state on a failed latest write */ })
+        .finally(() => {
+          this.inFlightWrites -= 1
+          if (this.inFlightWrites === 0 && this.pendingWrites.size === 0) this.adopt()
+        })
+    }
+  }
+
+  /**
+   * Read the current immutable theme snapshot.
+   * @returns the current snapshot (stable reference until the next change).
+   */
+  getTheme(): ThemeSnapshot {
+    return this.snapshot
+  }
+
+  /**
+   * Export the current token directory without reading DOM or computed styles.
+   * @returns stable JSON-safe token descriptions, including registered and override-only names.
+   */
+  exportInspectTokens(): ThemeTokenInspection[] {
+    const tokens = new Map(BUILTIN_INSPECT_TOKENS.map(token => [token.name, token]))
+    for (const theme of this.themes) {
+      for (const name of Object.keys(theme.tokens)) {
+        if (!tokens.has(name)) tokens.set(name, dynamicToken(name))
+      }
+    }
+    for (const layer of this.overrides.values()) {
+      for (const name of Object.keys(layer.tokens)) {
+        if (!tokens.has(name)) tokens.set(name, dynamicToken(name))
+      }
+    }
+    return [...tokens.values()].map(token => ({ ...token })).sort((left, right) => left.name.localeCompare(right.name))
+  }
+
+  /**
+   * Switch the color-scheme preference — or select a registered extension
+   * theme id. Built-in preferences are written through the settings scope.
+   * @param id - a registered theme id or `system`; unknown ids throw.
+   */
+  setTheme(id: string): void {
+    if (id !== 'system' && !this.themes.some(t => t.id === id)) {
+      throw new Error(`theme "${id}" is not registered`)
+    }
+    if (this.preference === id) return
+    this.preference = id as ThemePreference
+    if (isThemePreference(id)) {
+      this.settings = { ...this.settings, preference: id }
+      this.queueWrite(THEME_PREFERENCE_FIELD, id)
+    }
+    this.publish()
+  }
+
+  /**
+   * Assign a family to one color-scheme half.
+   * @param mode - which half to paint.
+   * @param familyId - builtin or custom family id.
+   */
+  setThemeHalf(mode: 'light' | 'dark', familyId: string): void {
+    const family = resolveThemeFamily(familyId, this.settings.customThemes)
+    if (family.id !== familyId && familyId !== DEFAULT_FAMILY_ID) {
+      throw new Error(`theme family "${familyId}" is not registered`)
+    }
+    const field = mode === 'dark' ? THEME_DARK_FAMILY_FIELD : THEME_LIGHT_FAMILY_FIELD
+    if (this.settings[field] === familyId) return
+    this.settings = {
+      ...this.settings,
+      [field]: familyId,
+    }
+    this.queueWrite(field, familyId)
+    this.publish()
+  }
+
+  /**
+   * Paint a transient family over the active halves without persisting
+   * anything: the theme editor calls this on every draft change so the user
+   * sees the colors live. `null` restores the durable selection. The preview
+   * never enters the settings scope, so closing the editor (or reloading)
+   * always returns to the stored theme.
+   * @param family - draft family to preview, or null to clear.
+   */
+  setPreviewFamily(family: ThemeFamily | null): void {
+    if (this.previewedFamily === family) return
+    this.previewedFamily = family
+    this.publish()
+  }
+
+  /**
+   * Replace the durable custom-family list.
+   * @param customThemes - next custom families.
+   */
+  setCustomThemes(customThemes: readonly ThemeFamily[]): void {
+    const next = customThemes.map(family => ({ ...family, origin: 'custom' as const }))
+    this.settings = { ...this.settings, customThemes: next }
+    if (this.settings.activeLightThemeId !== DEFAULT_FAMILY_ID
+      && !listThemeFamilies(next).some(family => family.id === this.settings.activeLightThemeId)) {
+      this.settings = { ...this.settings, activeLightThemeId: DEFAULT_FAMILY_ID }
+      this.queueWrite(THEME_LIGHT_FAMILY_FIELD, DEFAULT_FAMILY_ID)
+    }
+    if (this.settings.activeDarkThemeId !== DEFAULT_FAMILY_ID
+      && !listThemeFamilies(next).some(family => family.id === this.settings.activeDarkThemeId)) {
+      this.settings = { ...this.settings, activeDarkThemeId: DEFAULT_FAMILY_ID }
+      this.queueWrite(THEME_DARK_FAMILY_FIELD, DEFAULT_FAMILY_ID)
+    }
+    this.queueWrite(THEME_CUSTOM_THEMES_FIELD, next)
+    this.publish()
+  }
+
+  /**
+   * Persist glass-surface opacity.
+   * @param glassOpacity - integer percent 40–100.
+   */
+  setGlassOpacity(glassOpacity: number): void {
+    if (this.settings.glassOpacity === glassOpacity) return
+    this.settings = { ...this.settings, glassOpacity }
+    this.queueWrite(THEME_GLASS_OPACITY_FIELD, glassOpacity)
+    this.publish()
+  }
+
+  /**
+   * Persist wallpaper image and/or the two effect sliders.
+   * @param patch - one or more wallpaper fields.
+   */
+  setWallpaper(patch: Partial<Pick<ThemeSettings, 'wallpaperImage' | 'wallpaperBlur' | 'wallpaperPixelate'>>): void {
+    const next: Pick<ThemeSettings, 'wallpaperImage' | 'wallpaperBlur' | 'wallpaperPixelate'> = {
+      wallpaperImage: this.settings.wallpaperImage,
+      wallpaperBlur: this.settings.wallpaperBlur,
+      wallpaperPixelate: this.settings.wallpaperPixelate,
+    }
+    if (patch.wallpaperImage !== undefined) {
+      next.wallpaperImage = patch.wallpaperImage === '' || isWallpaperDataUrl(patch.wallpaperImage)
+        ? patch.wallpaperImage
+        : ''
+    }
+    if (patch.wallpaperBlur !== undefined) next.wallpaperBlur = clampWallpaperEffect(patch.wallpaperBlur)
+    if (patch.wallpaperPixelate !== undefined) next.wallpaperPixelate = clampWallpaperEffect(patch.wallpaperPixelate)
+    if (next.wallpaperImage === this.settings.wallpaperImage
+      && next.wallpaperBlur === this.settings.wallpaperBlur
+      && next.wallpaperPixelate === this.settings.wallpaperPixelate) {
+      return
+    }
+    this.settings = { ...this.settings, ...next }
+    if (patch.wallpaperImage !== undefined) this.queueWrite(THEME_WALLPAPER_IMAGE_FIELD, next.wallpaperImage)
+    if (patch.wallpaperBlur !== undefined) this.queueWrite(THEME_WALLPAPER_BLUR_FIELD, next.wallpaperBlur)
+    if (patch.wallpaperPixelate !== undefined) this.queueWrite(THEME_WALLPAPER_PIXELATE_FIELD, next.wallpaperPixelate)
+    this.publish()
+  }
+
+  /**
+   * Persist typography extras.
+   * @param patch - one or more font fields.
+   */
+  setTypography(patch: Partial<Pick<ThemeSettings, 'fontFamilySans' | 'fontFamilyCode' | 'fontSizeInterface' | 'fontSizeCode' | 'fontFamilyComposer' | 'fontFamilyTerminal'>>): void {
+    this.settings = { ...this.settings, ...patch }
+    for (const [field, value] of Object.entries(patch)) {
+      this.queueWrite(field, value)
+    }
+    this.publish()
+  }
+
+  /**
+   * Adopt the scope's accepted durable section without writing it back.
+   * Skipped while local writes are queued or in flight: mid-drag the durable
+   * echo lags the local snapshot, and adopting it would snap the control back.
+   */
+  private adopt(): void {
+    if (this.pendingWrites.size > 0 || this.inFlightWrites > 0) return
+    const section = this.host.getSnapshot().value
+    if (section === undefined) return
+    const next = resolveThemeSettings(section)
+    if (sameSettings(this.settings, next) && this.preference === next.preference) return
+    this.settings = next
+    this.preference = next.preference
+    this.publish()
+  }
+
+  /**
+   * Register a theme. Duplicate id throws (single occupant per id; the
+   * built-in pair counts; `system` is a preference, not a registrable id).
+   * @param definition - theme id, colorScheme, and alias-token overrides.
+   * @returns disposer. Disposing the theme backing the active preference
+   * resets the preference to the default so the UI never keeps tokens of an
+   * unregistered theme.
+   */
+  register(definition: ThemeDefinition): () => void {
+    if (definition.id === 'system') throw new Error('"system" is a preference, not a registrable theme id')
+    if (this.themes.some(t => t.id === definition.id)) {
+      throw new Error(`theme "${definition.id}" is already registered`)
+    }
+    this.themes = [...this.themes, definition]
+    this.publish()
+    return () => {
+      if (!this.themes.some(t => t.id === definition.id)) return
+      this.themes = this.themes.filter(t => t.id !== definition.id)
+      if (this.preference === definition.id) {
+        this.preference = DEFAULT_PREFERENCE
+        this.settings = { ...this.settings, preference: DEFAULT_PREFERENCE }
+      }
+      this.publish()
+    }
+  }
+
+  /**
+   * Stack a token override layer on top of the active theme.
+   * @param source - layer identity.
+   * @param tokens - token-name → `{ light, dark }` value pairs.
+   * @returns disposer removing exactly the layer this call created.
+   */
+  overrideTokens(source: string, tokens: ThemeTokenOverrides): () => void {
+    const layer = { seq: this.overrideSeq++, tokens: validateOverrides(source, tokens) }
+    this.overrides.set(source, layer)
+    this.publish()
+    return () => {
+      if (this.overrides.get(source) !== layer) return
+      this.overrides.delete(source)
+      this.publish()
+    }
+  }
+
+  private resolvedMode(): 'light' | 'dark' {
+    if (this.preference === 'system') return this.media?.matches === true ? 'dark' : 'light'
+    if (this.preference === 'dark' || this.preference === 'light') return this.preference
+    const registered = this.themes.find(t => t.id === this.preference)
+    return registered?.colorScheme ?? 'light'
+  }
+
+  private buildSnapshot(): ThemeSnapshot {
+    const mode = this.resolvedMode()
+    const familyId = mode === 'dark' ? this.settings.activeDarkThemeId : this.settings.activeLightThemeId
+    const family = this.previewedFamily ?? resolveThemeFamily(familyId, this.settings.customThemes)
+    const registered = !isThemePreference(this.preference)
+      ? this.themes.find(t => t.id === this.preference)
+      : undefined
+    const base: ThemeDefinition = registered ?? {
+      id: family.id,
+      colorScheme: mode,
+      tokens: family.id === DEFAULT_FAMILY_ID ? {} : deriveThemeTokens(family[mode]),
+    }
+    return Object.freeze({
+      preference: isThemePreference(this.preference) ? this.preference : this.settings.preference,
+      active: this.composeActive(base, mode),
+      themes: Object.freeze([...this.themes]),
+      families: Object.freeze(listThemeFamilies(this.settings.customThemes)),
+      activeLightThemeId: this.settings.activeLightThemeId,
+      activeDarkThemeId: this.settings.activeDarkThemeId,
+      customThemes: Object.freeze([...this.settings.customThemes]),
+      glassOpacity: this.settings.glassOpacity,
+      wallpaperImage: this.settings.wallpaperImage,
+      wallpaperBlur: this.settings.wallpaperBlur,
+      wallpaperPixelate: this.settings.wallpaperPixelate,
+      fontFamilySans: this.settings.fontFamilySans,
+      fontFamilyCode: this.settings.fontFamilyCode,
+      fontSizeInterface: this.settings.fontSizeInterface,
+      fontSizeCode: this.settings.fontSizeCode,
+      fontFamilyComposer: this.settings.fontFamilyComposer,
+      fontFamilyTerminal: this.settings.fontFamilyTerminal,
+      revision: this.revision,
+    })
+  }
+
+  /**
+   * Fold family tokens, glass/font extras, and override layers into the
+   * active definition.
+   */
+  private composeActive(active: ThemeDefinition, mode: 'light' | 'dark'): ThemeDefinition {
+    const tokens: ThemeTokens = { ...active.tokens }
+    tokens['--dsw-alias-glass-opacity'] = `${this.settings.glassOpacity}%`
+    if (isWallpaperDataUrl(this.settings.wallpaperImage)) {
+      Object.assign(tokens, mixWallpaperSurfaces(tokens, mode, this.settings.glassOpacity))
+    }
+    for (const layer of [...this.overrides.values()].sort((a, b) => a.seq - b.seq)) {
+      for (const [name, modes] of Object.entries(layer.tokens)) {
+        tokens[name] = modes[mode]
+      }
+    }
+    return Object.freeze({ ...active, colorScheme: mode, tokens: Object.freeze(tokens) })
+  }
+
+  private publish(): void {
+    this.revision += 1
+    this.snapshot = this.buildSnapshot()
+    this.ctx.emit('theme/change', this.snapshot)
+  }
+}
+
+function sameSettings(left: ThemeSettings, right: ThemeSettings): boolean {
+  return left.preference === right.preference
+    && left.activeLightThemeId === right.activeLightThemeId
+    && left.activeDarkThemeId === right.activeDarkThemeId
+    && left.glassOpacity === right.glassOpacity
+    && left.wallpaperImage === right.wallpaperImage
+    && left.wallpaperBlur === right.wallpaperBlur
+    && left.wallpaperPixelate === right.wallpaperPixelate
+    && left.fontFamilySans === right.fontFamilySans
+    && left.fontFamilyCode === right.fontFamilyCode
+    && left.fontSizeInterface === right.fontSizeInterface
+    && left.fontSizeCode === right.fontSizeCode
+    && left.fontFamilyComposer === right.fontFamilyComposer
+    && left.fontFamilyTerminal === right.fontFamilyTerminal
+    && JSON.stringify(left.customThemes) === JSON.stringify(right.customThemes)
+}
+
+function validateOverrides(source: string, tokens: ThemeTokenOverrides): ThemeTokenOverrides {
+  const validated: ThemeTokenOverrides = {}
+  for (const [name, value] of Object.entries<unknown>(tokens)) {
+    if (typeof value === 'string') {
+      throw new TypeError(
+        `theme override "${name}" from "${source}" is a bare string — pass { light: ${JSON.stringify(value)}, dark: ${JSON.stringify(value)} } `
+        + '(repeat the value when it is the same in both palettes); a single value goes illegible when the user switches color scheme',
+      )
+    }
+    if (typeof value !== 'object' || value === null
+      || typeof (value as { light?: unknown }).light !== 'string'
+      || typeof (value as { dark?: unknown }).dark !== 'string') {
+      throw new TypeError(
+        `theme override "${name}" from "${source}" must map to a { light, dark } pair of strings — one value per color scheme`,
+      )
+    }
+    const modes = value as ThemeTokenModes
+    validated[name] = { light: modes.light, dark: modes.dark }
+  }
+  return validated
+}
+
+function dynamicToken(name: string): ThemeTokenInspection {
+  return {
+    name,
+    description: 'Theme token registered by the current Client composition.',
+    valueType: 'CSS value',
+    requiresLightAndDark: true,
+    ...(name.startsWith('--') ? { cssVariable: name } : {}),
+  }
+}
+
+/**
+ * Required services: settings transport plus slots/locale for the Appearance
+ * page. `remote` carries the forwarded settings invalidation that
+ * `bindSettingsScope` subscribes to on this context.
+ */
+export const inject = ['slots', 'locale', 'connection', 'remote', 'settingsScope']
+
+/**
+ * Client plugin body: provide the theme service and register the
+ * feature-owned Appearance settings section.
+ * @param ctx - client cordis context.
+ */
+export function apply(ctx: ClientContext): void {
+  const host = ctx.settingsScope.bind<ThemeSettings>({ namespace: THEME_SETTINGS_NAMESPACE })
+  const theme = new ThemeRuntime(ctx, host)
+  ctx.provide('theme', theme)
+
+  ctx.effect(() => ctx.locale.register(SETTINGS_NS, { zh, en }), 'ui-theme: settings page dictionaries')
+
+  const extras = (snapshot: ThemeSnapshot): void => {
+    applyAppearanceDocumentExtras({
+      fontFamilySans: snapshot.fontFamilySans,
+      fontFamilyCode: snapshot.fontFamilyCode,
+      fontSizeInterface: snapshot.fontSizeInterface,
+      fontSizeCode: snapshot.fontSizeCode,
+      fontFamilyComposer: snapshot.fontFamilyComposer,
+      fontFamilyTerminal: snapshot.fontFamilyTerminal,
+      wallpaperImage: snapshot.wallpaperImage,
+      wallpaperBlur: snapshot.wallpaperBlur,
+      wallpaperPixelate: snapshot.wallpaperPixelate,
+    })
+  }
+  extras(theme.getTheme())
+  ctx.on('theme/change', extras)
+
+  const store = createAppearanceRowStore()
+  let bound: BoundActions<typeof store> | undefined
+  const sync = (snapshot: ThemeSnapshot): void => {
+    bound?.sync(snapshot, snapshot.revision)
+  }
+  ctx.on('theme/change', sync)
+  const t = ctx.locale.bind(SETTINGS_NS)
+  const injected = (actions: BoundActions<typeof store>): AppearanceSectionInjected => {
+    bound = actions
+    sync(theme.getTheme())
+    return {
+      setTheme: (id) => { theme.setTheme(id) },
+      setThemeHalf: (mode, id) => { theme.setThemeHalf(mode, id) },
+      setCustomThemes: (families) => { theme.setCustomThemes(families) },
+      previewTheme: (family) => { theme.setPreviewFamily(family) },
+      setGlassOpacity: (value) => { theme.setGlassOpacity(value) },
+      setWallpaper: (patch) => { theme.setWallpaper(patch) },
+      setTypography: (patch) => { theme.setTypography(patch) },
+    }
+  }
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
+    id: 'appearance',
+    order: 5,
+    label: () => t('nav'),
+    store,
+    locale: SETTINGS_NS,
+    inject: injected,
+  }, AppearanceSection))
+}
